@@ -27,12 +27,6 @@ import (
 	"io"
 )
 
-// DefaultPassword is the string "changeit", a commonly-used password for
-// PKCS#12 files. Due to the weak encryption used by PKCS#12, it is
-// RECOMMENDED that you use DefaultPassword when encoding PKCS#12 files,
-// and protect the PKCS#12 files using other means.
-const DefaultPassword = "changeit"
-
 var (
 	oidDataContentType          = asn1.ObjectIdentifier([]int{1, 2, 840, 113549, 1, 7, 1})
 	oidEncryptedDataContentType = asn1.ObjectIdentifier([]int{1, 2, 840, 113549, 1, 7, 6})
@@ -248,6 +242,64 @@ func Decode(pfxData []byte, password string) (privateKey interface{}, certificat
 // be the leaf certificate, and subsequent certificates, if any, are assumed to
 // comprise the CA certificate chain.
 func DecodeChain(pfxData []byte, password string) (privateKey interface{}, certificate *x509.Certificate, caCerts []*x509.Certificate, err error) {
+	privateKey, certs, _, err := DecodeAll(pfxData, password)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if privateKey == nil {
+		return nil, nil, nil, errors.New("pkcs12: private key missing")
+	}
+	if len(certs) == 0 {
+		return nil, nil, nil, errors.New("pkcs12: certificate missing")
+	}
+
+	certificate = certs[0]
+	if len(certs) > 1 {
+		caCerts = certs[1:]
+	}
+
+	return
+}
+
+type SecretKey interface {
+	// Attributes return the PKCS12AttrSet of the safe bag
+	// https://tools.ietf.org/html/rfc7292#section-4.2
+	Attributes() map[string]string
+	Key() []byte
+	// FriendlyName return the value of `friendlyName`
+	// attribute if exists, otherwise it will return empty string
+	FriendlyName() string
+}
+
+type secretkey struct {
+	attrs map[string]string
+	key   []byte
+}
+
+func (s secretkey) Attributes() map[string]string {
+	return s.attrs
+}
+
+func (s secretkey) Key() []byte {
+	return s.key
+}
+
+func (s secretkey) FriendlyName() string {
+	return s.attrs["friendlyName"]
+}
+
+// DecodeAll extracts private key, certificates and secret keys from pfxData.
+// This function support following scenarios:
+// 1. only secret keys
+// 2. only trusted certificates without private key
+// 3. at least one certificate and only one private key
+// 4. the combination of above 3 scenarios
+func DecodeAll(pfxData []byte, password string) (
+	privateKey interface{},
+	certificates []*x509.Certificate,
+	secretKeys []SecretKey,
+	err error) {
 	encodedPassword, err := bmpString(password)
 	if err != nil {
 		return nil, nil, nil, err
@@ -273,32 +325,40 @@ func DecodeChain(pfxData []byte, password string) (privateKey interface{}, certi
 				err = errors.New("pkcs12: expected exactly one certificate in the certBag")
 				return nil, nil, nil, err
 			}
-			if certificate == nil {
-				certificate = certs[0]
-			} else {
-				caCerts = append(caCerts, certs[0])
-			}
-
+			certificates = append(certificates, certs[0])
 		case bag.Id.Equal(oidPKCS8ShroundedKeyBag):
 			if privateKey != nil {
 				err = errors.New("pkcs12: expected exactly one key bag")
 				return nil, nil, nil, err
 			}
-
 			if privateKey, err = decodePkcs8ShroudedKeyBag(bag.Value.Bytes, encodedPassword); err != nil {
 				return nil, nil, nil, err
 			}
+		case bag.Id.Equal(oidSecretBag):
+			seckey := &secretkey{
+				attrs: make(map[string]string),
+			}
+			for _, attr := range bag.Attributes {
+				attr := attr
+				k, v, err := convertAttribute(&attr)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				seckey.attrs[k] = v
+			}
+			seckey.key, err = decodeSecretBag(bag.Value.Bytes, encodedPassword)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			secretKeys = append(secretKeys, seckey)
 		}
 	}
 
-	if certificate == nil {
-		return nil, nil, nil, errors.New("pkcs12: certificate missing")
-	}
-	if privateKey == nil {
-		return nil, nil, nil, errors.New("pkcs12: private key missing")
+	if privateKey == nil && len(certificates) == 0 && len(secretKeys) == 0 {
+		return nil, nil, nil, errors.New("pkcs12: could not find any private key, certificate or secret key")
 	}
 
-	return
+	return privateKey, certificates, secretKeys, nil
 }
 
 func getSafeContents(p12Data, password []byte) (bags []safeBag, updatedPassword []byte, err error) {
@@ -342,8 +402,18 @@ func getSafeContents(p12Data, password []byte) (bags []safeBag, updatedPassword 
 		return nil, nil, err
 	}
 
-	if len(authenticatedSafe) != 2 {
-		return nil, nil, NotImplementedError("expected exactly two items in the authenticated safe")
+	// based on https://tools.ietf.org/html/rfc7292, the items in authenticated safe should be 1 at least,
+	// and 3 at most.
+	// however, the original implementation only supports following behavior:
+	//   - two items in authenticated safe (one that's encrypted with RC2 and contains the certificates,
+	// 	   and another that is unencrypted and contains the private key shrouded with 3DES)
+	// To be compatible with the implementation of Java 8 or above's PKCS#12 store:
+	//   - one item in authenticated safe (either encrypted data contains certificates or unencrypted data
+	//	   contains secret key shrouded with 3DES)
+	//   - two items in authenticated safe (one that's encrypted with RC2 and contains the certificates,
+	// 	   and another that is unencrypted and contains the private key (secret key) shrouded with 3DES)
+	if len(authenticatedSafe) != 1 && len(authenticatedSafe) != 2 {
+		return nil, nil, NotImplementedError("expected either one or two items in the authenticated safe")
 	}
 
 	for _, ci := range authenticatedSafe {
