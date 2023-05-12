@@ -1,43 +1,42 @@
 name: Go
 
-on: [push, pull_request]
+on: pull_request
 
 jobs:
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_UBUNTU && fromJSON(vars.RUNNER_UBUNTU) || 'ubuntu-latest' }}
     container: golang:1.14-stretch
     steps:
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     - name: Build
       run: make build
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_UBUNTU && fromJSON(vars.RUNNER_UBUNTU) || 'ubuntu-latest' }}
     container: golang:1.14-stretch
     steps:
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     - name: Run tests
       run: make test
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_UBUNTU && fromJSON(vars.RUNNER_UBUNTU) || 'ubuntu-latest' }}
     steps:
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     - name: Fix files without a final new line
-      uses: Logerfo/newline-action@0.0.2
+      uses: Logerfo/newline-action@0.0.4
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@v2
-      with:
-        version: v1.29   
+      uses: golangci/golangci-lint-action@v3
+
